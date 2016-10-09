@@ -6,15 +6,18 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"io/ioutil"
 	"net/http"
 
 	"github.com/go-gorp/gorp"
 )
 
-const numChains = 1000
+const numChains int = 1000
 const selectChains string = "SELECT chain_fp FROM chains WHERE valid = 1 ORDER BY chain_id ASC LIMIT ? OFFSET ?"
 
-func getChains(db gorp.DbMap, chainCh chan [][]byte, initialOffset int) error {
+func getChains(db *gorp.DbMap, chainCh chan [][]byte, initialOffset int) error {
 	offset := initialOffset
 	for {
 		var chains [][]byte
@@ -29,7 +32,7 @@ func getChains(db gorp.DbMap, chainCh chan [][]byte, initialOffset int) error {
 		if len(chains) < numChains {
 			break
 		}
-		numChains += len(chains)
+		offset += len(chains)
 	}
 	return nil
 }
@@ -42,7 +45,7 @@ type report struct {
 	endEntity bool
 }
 
-func getCerts(db gorp.DbMap, fingerprint []byte) ([][]byte, error) {
+func getCerts(db *gorp.DbMap, fingerprint []byte) ([][]byte, error) {
 	var reports []report
 	_, err := db.Select(reports, selectReports, fingerprint)
 	if err != nil {
@@ -68,30 +71,44 @@ func getCerts(db gorp.DbMap, fingerprint []byte) ([][]byte, error) {
 	return append([][]byte{leaf}, others...), nil
 }
 
+type httpClient interface {
+	Post(string, string, io.Reader) (*http.Response, error)
+}
+
+type dryClient struct{}
+
+func (dc *dryClient) Post(string, string, io.Reader) (*http.Response, error) {
+	return &http.Response{StatusCode: http.StatusOK}, nil
+}
+
 const logAddr = "https://ct.googleapis.com/rocketeer/ct/v1/add-chain"
 
-func submit(c *http.Client, submission []byte) error {
+func submit(c httpClient, submission []byte) error {
 	resp, err := c.Post(logAddr, "encoding/json", bytes.NewBuffer(submission))
 	if err != nil {
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
+		var bodyStr string
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
-			body = err.Error()
+			bodyStr = err.Error()
 		}
-		return fmt.Errorf("non-200 status code, body: %s", body)
+		bodyStr = string(body)
+		return fmt.Errorf("non-200 status code, body: %s", bodyStr)
 	}
 	return nil
 }
 
 func submitChains(submissions chan []byte) error {
+	c := new(http.Client)
 	for submission := range submissions {
-		err := submit(submission)
+		err := submit(c, submission)
 		if err != nil {
 			return err
 		}
 	}
+	return nil
 }
 
 type ctSubmission struct {
@@ -111,11 +128,19 @@ func certsToSub(certs [][]byte) []byte {
 }
 
 func main() {
-	chainCh := make(chan [][]byte, 100)
+	chainsCh := make(chan [][]byte, 100)
 	submissions := make(chan []byte, 100000)
 	initialOffset := 0
+	dbURI := ""
+
+	innerDB, err := sql.Open("mysql", dbURI)
+	if err != nil {
+		panic(err)
+	}
+	db := &gorp.DbMap{Db: innerDB, Dialect: gorp.MySQLDialect{Engine: "InnoDB", Encoding: "UTF8"}}
+
 	go func() {
-		err := getChains(nil, chainCh, initialOffset)
+		err := getChains(db, chainsCh, initialOffset)
 		if err != nil {
 			panic(err)
 		}
@@ -128,7 +153,7 @@ func main() {
 	}()
 	for chains := range chainsCh {
 		for _, chainFP := range chains {
-			certs, err := getCerts(nil, chainFP)
+			certs, err := getCerts(db, chainFP)
 			if err != nil {
 				panic(err)
 			}
