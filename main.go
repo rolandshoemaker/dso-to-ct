@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/go-gorp/gorp"
+	"github.com/go-sql-driver/mysql"
 )
 
 const (
