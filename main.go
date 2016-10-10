@@ -6,22 +6,24 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/go-gorp/gorp"
-	"github.com/go-sql-driver/mysql"
+	_ "github.com/go-sql-driver/mysql"
 )
 
 const (
 	numChains     int    = 1000
 	selectChains  string = "SELECT chain_fp, chain_id FROM chains WHERE valid = 1 ORDER BY chain_id ASC LIMIT ? OFFSET ?"
-	selectReports string = "SELECT DISTINCT(cert_fp), end_entity FROM reports WHERE cert_fp = ?"
+	selectReports string = "SELECT DISTINCT(cert_fp), is_end_entity FROM reports WHERE chain_fp = ?"
 	selectRawCert string = "SELECT raw_cert FROM certs WHERE cert_fp = ?"
 	logAddr              = "https://ct.googleapis.com/rocketeer/ct/v1/add-chain"
 )
@@ -29,6 +31,10 @@ const (
 var (
 	lastSubmittedChain int64
 	numSubmitted       int64
+
+	dbURI      = flag.String("dbURI", "", "")
+	dryRun     = flag.Bool("dryRun", false, "")
+	initOffset = flag.Int("initialChainID", 0, "")
 )
 
 type chain struct {
@@ -41,7 +47,7 @@ func getChains(db *gorp.DbMap, chainCh chan []chain, initialOffset int) error {
 	offset := initialOffset
 	for {
 		var chains []chain
-		_, err := db.Select(chains, selectChains, numChains, offset)
+		_, err := db.Select(&chains, selectChains, numChains, offset)
 		if err == sql.ErrNoRows {
 			break
 		}
@@ -58,13 +64,13 @@ func getChains(db *gorp.DbMap, chainCh chan []chain, initialOffset int) error {
 }
 
 type report struct {
-	certFP    string
-	endEntity bool
+	CertFP    string `db:"cert_fp"`
+	EndEntity bool   `db:"is_end_entity"`
 }
 
 func getCerts(db *gorp.DbMap, partialChain *chain) error {
 	var reports []report
-	_, err := db.Select(reports, selectReports, partialChain.Fingerprint)
+	_, err := db.Select(&reports, selectReports, partialChain.Fingerprint)
 	if err != nil {
 		return err
 	}
@@ -72,11 +78,11 @@ func getCerts(db *gorp.DbMap, partialChain *chain) error {
 	var others [][]byte
 	for _, r := range reports {
 		var raw []byte
-		err := db.SelectOne(&raw, selectRawCert, r.certFP)
+		err := db.SelectOne(&raw, selectRawCert, r.CertFP)
 		if err != nil {
 			return err
 		}
-		if r.endEntity {
+		if r.EndEntity {
 			leaf = raw
 		} else {
 			others = append(others, raw)
@@ -100,7 +106,7 @@ func (dc *dryClient) Post(string, string, io.Reader) (*http.Response, error) {
 	return &http.Response{StatusCode: http.StatusOK}, nil
 }
 
-func submit(c httpClient, submission *chain) error {
+func submit(c httpClient, submission chain) error {
 	resp, err := c.Post(logAddr, "encoding/json", bytes.NewBuffer(certsToSub(submission.certs)))
 	if err != nil {
 		return err
@@ -119,15 +125,28 @@ func submit(c httpClient, submission *chain) error {
 	return nil
 }
 
-func submitChains(submissions chan *chain) error {
-	c := new(http.Client)
-	for submission := range submissions {
-		err := submit(c, submission)
-		if err != nil {
-			return err
-		}
+func submitChains(submissions chan chain) error {
+	var c httpClient
+	if *dryRun {
+		c = &dryClient{}
+	} else {
+		c = new(http.Client)
 	}
-	atomic.StoreInt64(&lastSubmittedChain, 999) // FIXME: propogate chain ID
+	wg := new(sync.WaitGroup)
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			for submission := range submissions {
+				err := submit(c, submission)
+				if err != nil {
+					continue
+				}
+				atomic.StoreInt64(&lastSubmittedChain, submission.ID)
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait()
 	return nil
 }
 
@@ -147,7 +166,7 @@ func certsToSub(certs [][]byte) []byte {
 	return j
 }
 
-func printStats(t *time.Ticker, chains chan []chain, submissions chan *chain) {
+func printStats(t *time.Ticker, chains chan []chain, submissions chan chain) {
 	lastNumSubmitted := int64(0)
 	rate := 0.0
 	for range t.C {
@@ -160,16 +179,16 @@ func printStats(t *time.Ticker, chains chan []chain, submissions chan *chain) {
 			atomic.LoadInt64(&numSubmitted),
 			rate,
 		)
+		lastNumSubmitted = atomic.LoadInt64(&numSubmitted)
 	}
 }
 
 func main() {
+	flag.Parse()
 	chainsCh := make(chan []chain, 100)
-	submissions := make(chan *chain, 100000)
-	initialOffset := 0
-	dbURI := ""
+	submissions := make(chan chain, 100000)
 
-	innerDB, err := sql.Open("mysql", dbURI)
+	innerDB, err := sql.Open("mysql", *dbURI)
 	if err != nil {
 		panic(err)
 	}
@@ -177,12 +196,13 @@ func main() {
 
 	defer func() {
 		// record last submitted chain id
-		recovered := false
+		var recovered interface{}
 		if r := recover(); r != nil {
-			recovered = true
+			recovered = r
 		}
 		fmt.Printf("\n# [Last submitted chain ID: %d]\n", atomic.LoadInt64(&lastSubmittedChain))
-		if recovered {
+		if recovered != nil {
+			fmt.Println("ERROR", recovered)
 			os.Exit(1)
 		}
 	}()
@@ -191,7 +211,7 @@ func main() {
 	go printStats(t, chainsCh, submissions)
 
 	go func() {
-		err := getChains(db, chainsCh, initialOffset)
+		err := getChains(db, chainsCh, *initOffset)
 		if err != nil {
 			panic(err)
 		}
@@ -211,11 +231,12 @@ func main() {
 		for _, partialChain := range chains {
 			err := getCerts(db, &partialChain)
 			if err != nil {
-				panic(err)
+				// panic(err)
+				continue // skip broken chains
 			}
-			submissions <- &partialChain
+			submissions <- partialChain
 		}
-		close(submissions)
 	}
+	close(submissions)
 	<-finished
 }
