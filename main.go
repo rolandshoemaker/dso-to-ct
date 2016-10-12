@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	numChains     int    = 1000
+	maxChains     int    = 1000
 	selectChains  string = "SELECT chain_fp, chain_id FROM chains WHERE valid = 1 ORDER BY chain_id ASC LIMIT ? OFFSET ?"
 	selectReports string = "SELECT DISTINCT(cert_fp), is_end_entity FROM reports WHERE chain_fp = ?"
 	selectRawCert string = "SELECT raw_cert FROM certs WHERE cert_fp = ?"
@@ -31,10 +31,12 @@ const (
 var (
 	lastSubmittedChain int64
 	numSubmitted       int64
+	numNewSubmitted    int64
 
 	dbURI      = flag.String("dbURI", "", "")
 	dryRun     = flag.Bool("dryRun", false, "")
 	initOffset = flag.Int("initialChainID", 0, "")
+	workers    = flag.Int("workers", 5, "")
 )
 
 type chain struct {
@@ -47,7 +49,7 @@ func getChains(db *gorp.DbMap, chainCh chan []chain, initialOffset int) error {
 	offset := initialOffset
 	for {
 		var chains []chain
-		_, err := db.Select(&chains, selectChains, numChains, offset)
+		_, err := db.Select(&chains, selectChains, maxChains, offset)
 		if err == sql.ErrNoRows {
 			break
 		}
@@ -55,7 +57,7 @@ func getChains(db *gorp.DbMap, chainCh chan []chain, initialOffset int) error {
 			return err
 		}
 		chainCh <- chains
-		if len(chains) < numChains {
+		if len(chains) < maxChains {
 			break
 		}
 		offset += len(chains)
@@ -106,11 +108,16 @@ func (dc *dryClient) Post(string, string, io.Reader) (*http.Response, error) {
 	return &http.Response{StatusCode: http.StatusOK}, nil
 }
 
+type ctResponse struct {
+	Timestamp int64
+}
+
 func submit(c httpClient, submission chain) error {
 	resp, err := c.Post(logAddr, "encoding/json", bytes.NewBuffer(certsToSub(submission.certs)))
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		var bodyStr string
 		body, err := ioutil.ReadAll(resp.Body)
@@ -119,6 +126,18 @@ func submit(c httpClient, submission chain) error {
 		}
 		bodyStr = string(body)
 		return fmt.Errorf("non-200 status code, body: %s", bodyStr)
+	}
+	b, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	var ctr ctResponse
+	err = json.Unmarshal(b, &ctr)
+	if err != nil {
+		return err
+	}
+	if ctr.Timestamp > int64(time.Now().UTC().Add(-time.Hour).Nanosecond()/1000) {
+		atomic.AddInt64(&numNewSubmitted, 1)
 	}
 	atomic.StoreInt64(&lastSubmittedChain, submission.ID)
 	atomic.AddInt64(&numSubmitted, 1)
@@ -133,7 +152,7 @@ func submitChains(submissions chan chain) error {
 		c = new(http.Client)
 	}
 	wg := new(sync.WaitGroup)
-	for i := 0; i < 5; i++ {
+	for i := 0; i < *workers; i++ {
 		wg.Add(1)
 		go func() {
 			for submission := range submissions {
@@ -170,16 +189,19 @@ func printStats(t *time.Ticker, chains chan []chain, submissions chan chain) {
 	lastNumSubmitted := int64(0)
 	rate := 0.0
 	for range t.C {
-		rate = float64(atomic.LoadInt64(&numSubmitted)-lastNumSubmitted) / 30.0
+		num := atomic.LoadInt64(&numSubmitted)
+		rate = float64(num-lastNumSubmitted) / 30.0
 		fmt.Printf(
-			"%s [pending chains: %d, pending submissions: %d, completed submissions: %d, submission rate: %3.2f/s]\n",
+			"%s [pending chains: %d, pending submissions: %d, completed submissions: %d (%d new), submission rate: %3.2f/s, last submitted chain id: %d]\n",
 			time.Now().Format(time.RFC1123),
-			len(chains)*numChains,
+			len(chains)*maxChains,
 			len(submissions),
-			atomic.LoadInt64(&numSubmitted),
+			num,
+			atomic.LoadInt64(&numNewSubmitted),
 			rate,
+			atomic.LoadInt64(&lastSubmittedChain),
 		)
-		lastNumSubmitted = atomic.LoadInt64(&numSubmitted)
+		lastNumSubmitted = num
 	}
 }
 
