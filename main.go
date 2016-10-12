@@ -37,6 +37,7 @@ var (
 	dryRun     = flag.Bool("dryRun", false, "")
 	initOffset = flag.Int("initialChainID", 0, "")
 	workers    = flag.Int("workers", 5, "")
+	statPeriod = flag.Duration("statsInterval", time.Second*15, "")
 )
 
 type chain struct {
@@ -45,8 +46,8 @@ type chain struct {
 	certs       [][]byte `db:"-"`
 }
 
-func getChains(db *gorp.DbMap, chainCh chan []chain, initialOffset int) error {
-	offset := initialOffset
+func getChains(db *gorp.DbMap, chainCh chan []chain) error {
+	offset := *initOffset
 	for {
 		var chains []chain
 		_, err := db.Select(&chains, selectChains, maxChains, offset)
@@ -136,7 +137,7 @@ func submit(c httpClient, submission chain) error {
 	if err != nil {
 		return err
 	}
-	if ctr.Timestamp > int64(time.Now().UTC().Add(-time.Hour).Nanosecond()/1000) {
+	if ctr.Timestamp > int64(time.Now().UTC().Add(-time.Hour).UnixNano()/1000) {
 		atomic.AddInt64(&numNewSubmitted, 1)
 	}
 	atomic.StoreInt64(&lastSubmittedChain, submission.ID)
@@ -229,11 +230,11 @@ func main() {
 		}
 	}()
 
-	t := time.NewTicker(30 * time.Second)
+	t := time.NewTicker(*statPeriod)
 	go printStats(t, chainsCh, submissions)
 
 	go func() {
-		err := getChains(db, chainsCh, *initOffset)
+		err := getChains(db, chainsCh)
 		if err != nil {
 			panic(err)
 		}
